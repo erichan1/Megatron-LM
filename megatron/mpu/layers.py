@@ -42,6 +42,10 @@ from .utils import VocabUtility
 from megatron import get_args, get_global_memory_buffer
 # from megatron.model.fused_bias_gelu import bias_gelu, bias_gelu_back
 
+from bitsandbytes.nn import Linear8bitLt, Int8Params
+
+QUANTIZED_INFERENCE = False
+
 
 _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {'tensor_model_parallel': False,
                                       'partition_dim': -1,
@@ -263,7 +267,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, input, weight, bias, gradient_accumulation_fusion,
-                async_grad_allreduce, sequence_parallel, apply_pre_gelu=False, apply_pre_ln=False):
+                async_grad_allreduce, sequence_parallel, apply_pre_gelu=False, apply_pre_ln=False, q_linear=None):
         ctx.save_for_backward(input, weight)
         ctx.use_bias = bias is not None
         ctx.gradient_accumulation_fusion = gradient_accumulation_fusion
@@ -292,9 +296,12 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         if ctx.apply_pre_gelu:
             total_input = gelu(total_input)
 
-        output = torch.matmul(total_input, weight.t())
-        if bias is not None:
-            output = output + bias
+        if q_linear is not None and QUANTIZED_INFERENCE is True:
+            output = q_linear(total_weight) # TODO do I have to transpose here?
+        else:
+            output = torch.matmul(total_input, weight.t())
+            if bias is not None:
+                output = output + bias
         return output
 
     @staticmethod
@@ -377,6 +384,23 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
 
         return grad_input, grad_weight, grad_bias, None, None, None, None
 
+def create_q_linear(weight, bias=None, has_fp16_weights=False, threshold=6.0, index=None):
+    """
+    weight: any kind of weight is fine. fp32, bf16, or fp16. We assume this is a CPU weight, to be converted to int8 upon sending to GPU.
+        From Tim Dettmers: "when cuda() or to(device) is called, Int8Param class should intercept, cast the CPU weight to fp16 and do the transformation to int8 and then cast it to device/cuda."
+    bias: the actual bias tensor. Can also be fp32, bf16, or f16 (optional)
+    Other arg explanations TBD
+    """
+    # TODO assert CPU initialization somehow
+    input_features, output_features = weight.shape # TODO maybe need to transpose
+    has_bias = bias is not None
+    q_linear = Linear8bitLt(input_features, output_features, bias=has_bias, has_fp16_weights=has_fp16_weights, threshold=threshold, index=index)
+
+    # free the automatically created weight and replace with inputted weight. when state_dict is loaded this weight will get updated too.
+    q_linear.weight = Int8Params(weight.data, has_fp16_weights=has_fp16_weights)
+    if has_bias:
+        q_linear.bias = bias
+    return q_linear
 
 class ColumnParallelLinear(torch.nn.Module):
     """Linear layer with column parallelism.
@@ -472,6 +496,10 @@ class ColumnParallelLinear(torch.nn.Module):
                     self.bias.zero_()
         else:
             self.register_parameter('bias', None)
+
+        if QUANTIZED_INFERENCE:
+            self.q_linear = create_q_linear(self.weight, bias=self.bias, has_fp16_weights=False, threshold=6.0, index=None)
+
         self.async_tensor_model_parallel_allreduce = (
                 not no_async_tensor_model_parallel_allreduce and
                 world_size > 1)
@@ -493,7 +521,8 @@ class ColumnParallelLinear(torch.nn.Module):
         # Matrix multiply.
         output_parallel = LinearWithGradAccumulationAndAsyncCommunication.apply(
             input_parallel, self.weight, bias, self.gradient_accumulation_fusion,
-            self.async_tensor_model_parallel_allreduce, self.sequence_parallel, False)
+            self.async_tensor_model_parallel_allreduce, self.sequence_parallel, False, False,
+            self.q_linear)
         if self.gather_output:
             # All-gather across the partitions.
             assert not self.sequence_parallel
@@ -586,6 +615,10 @@ class RowParallelLinear(torch.nn.Module):
                 self.bias.zero_()
         else:
             self.register_parameter('bias', None)
+
+        if QUANTIZED_INFERENCE:
+            self.q_linear = create_q_linear(self.weight, bias=self.bias, has_fp16_weights=False, threshold=6.0, index=None)
+
         self.sequence_parallel = sequence_parallel
         self.gradient_accumulation_fusion = gradient_accumulation_fusion
         self.apply_pre_gelu = apply_pre_gelu
@@ -601,7 +634,8 @@ class RowParallelLinear(torch.nn.Module):
         # Matrix multiply.
         output_parallel = LinearWithGradAccumulationAndAsyncCommunication.apply(
             input_parallel, self.weight, None,
-            self.gradient_accumulation_fusion, None, None, self.apply_pre_gelu)
+            self.gradient_accumulation_fusion, None, None, self.apply_pre_gelu, False,
+            self.q_linear)
         # All-reduce across all the partitions.
         if self.sequence_parallel:
             output_ = reduce_scatter_to_sequence_parallel_region(output_parallel)
