@@ -297,7 +297,6 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             total_input = gelu(total_input)
 
         if q_linear is not None and QUANTIZED_INFERENCE is True:
-            # print(q_linear.weight.shape, total_input.shape)
             output = q_linear(total_input)
         else:
             output = torch.matmul(total_input, weight.t())
@@ -402,8 +401,9 @@ def post_hook(module, incompatible_keys):
     # we assume that the weight has been put on CPU and we disabled the initialization
     has_bias = module.bias is not None
     if has_bias:
-        raise Exception("LLM int8 conversion currently does not support bias. Assuming Zucchini model.")
+        raise Exception("LLM int8 conversion currently does not support bias.")
     module.q_linear = create_q_linear(module.weight, bias=None, has_fp16_weights=False, threshold=6.0, index=None)
+    # If there's another int8 method that requires some kind of conversion from fp16=>int8, put your logic for that here.
     module.q_linear.to(torch.cuda.current_device()) # send it over and get int8!
 
 def pre_hook(module, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
@@ -509,7 +509,6 @@ class ColumnParallelLinear(torch.nn.Module):
                     self.bias.zero_()
         else:
             self.register_parameter('bias', None)
-
         self.async_tensor_model_parallel_allreduce = (
                 not no_async_tensor_model_parallel_allreduce and
                 world_size > 1)
@@ -631,7 +630,6 @@ class RowParallelLinear(torch.nn.Module):
                 self.bias.zero_()
         else:
             self.register_parameter('bias', None)
-
         self.sequence_parallel = sequence_parallel
         self.gradient_accumulation_fusion = gradient_accumulation_fusion
         self.apply_pre_gelu = apply_pre_gelu
