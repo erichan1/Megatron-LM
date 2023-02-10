@@ -44,7 +44,7 @@ from megatron import get_args, get_global_memory_buffer
 
 from bitsandbytes.nn import Linear8bitLt, Int8Params
 
-QUANTIZED_INFERENCE = False
+QUANTIZED_INFERENCE = True
 
 
 _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {'tensor_model_parallel': False,
@@ -297,7 +297,8 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             total_input = gelu(total_input)
 
         if q_linear is not None and QUANTIZED_INFERENCE is True:
-            output = q_linear(total_weight) # TODO do I have to transpose here?
+            # print(q_linear.weight.shape, total_input.shape)
+            output = q_linear(total_input)
         else:
             output = torch.matmul(total_input, weight.t())
             if bias is not None:
@@ -391,16 +392,23 @@ def create_q_linear(weight, bias=None, has_fp16_weights=False, threshold=6.0, in
     bias: the actual bias tensor. Can also be fp32, bf16, or f16 (optional)
     Other arg explanations TBD
     """
-    # TODO assert CPU initialization somehow
-    input_features, output_features = weight.shape # TODO maybe need to transpose
+    output_features, input_features = weight.shape
     has_bias = bias is not None
     q_linear = Linear8bitLt(input_features, output_features, bias=has_bias, has_fp16_weights=has_fp16_weights, threshold=threshold, index=index)
-
-    # free the automatically created weight and replace with inputted weight. when state_dict is loaded this weight will get updated too.
-    q_linear.weight = Int8Params(weight.data, has_fp16_weights=has_fp16_weights)
-    if has_bias:
-        q_linear.bias = bias
+    q_linear.weight = weight
     return q_linear
+
+def post_hook(module, incompatible_keys):
+    # we assume that the weight has been put on CPU and we disabled the initialization
+    has_bias = module.bias is not None
+    if has_bias:
+        raise Exception("LLM int8 conversion currently does not support bias. Assuming Zucchini model.")
+    module.q_linear = create_q_linear(module.weight, bias=None, has_fp16_weights=False, threshold=6.0, index=None)
+    module.q_linear.to(torch.cuda.current_device()) # send it over and get int8!
+
+def pre_hook(module, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+    empty_data = torch.empty((module.quantized_output_size, module.quantized_input_size), requires_grad=False, dtype=torch.half)
+    module.weight = Int8Params(data=empty_data, has_fp16_weights=False, requires_grad=False) # on CPU
 
 class ColumnParallelLinear(torch.nn.Module):
     """Linear layer with column parallelism.
@@ -451,7 +459,12 @@ class ColumnParallelLinear(torch.nn.Module):
         # we allocate the transpose.
         # Initialize weight.
         # args = get_args()
-        if use_cpu_initialization:
+        if QUANTIZED_INFERENCE:
+            self.quantized_output_size = self.output_size_per_partition
+            self.quantized_input_size = self.input_size
+            self._register_load_state_dict_pre_hook(pre_hook, with_module=True)
+            self.register_load_state_dict_post_hook(post_hook)
+        elif use_cpu_initialization:
             self.weight = Parameter(torch.empty(self.output_size_per_partition,
                                                 self.input_size,
                                                 dtype=dtype
@@ -496,9 +509,6 @@ class ColumnParallelLinear(torch.nn.Module):
                     self.bias.zero_()
         else:
             self.register_parameter('bias', None)
-
-        if QUANTIZED_INFERENCE:
-            self.q_linear = create_q_linear(self.weight, bias=self.bias, has_fp16_weights=False, threshold=6.0, index=None)
 
         self.async_tensor_model_parallel_allreduce = (
                 not no_async_tensor_model_parallel_allreduce and
@@ -587,7 +597,13 @@ class RowParallelLinear(torch.nn.Module):
         # we allocate the transpose.
         # Initialize weight.
         # args = get_args()
-        if use_cpu_initialization:
+
+        if QUANTIZED_INFERENCE:
+            self.quantized_output_size = self.output_size
+            self.quantized_input_size = self.input_size_per_partition
+            self._register_load_state_dict_pre_hook(pre_hook, with_module=True)
+            self.register_load_state_dict_post_hook(post_hook)
+        elif use_cpu_initialization:
             self.weight = Parameter(torch.empty(self.output_size,
                                                 self.input_size_per_partition,
                                                 dtype=dtype,
@@ -615,9 +631,6 @@ class RowParallelLinear(torch.nn.Module):
                 self.bias.zero_()
         else:
             self.register_parameter('bias', None)
-
-        if QUANTIZED_INFERENCE:
-            self.q_linear = create_q_linear(self.weight, bias=self.bias, has_fp16_weights=False, threshold=6.0, index=None)
 
         self.sequence_parallel = sequence_parallel
         self.gradient_accumulation_fusion = gradient_accumulation_fusion
