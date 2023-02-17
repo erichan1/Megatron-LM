@@ -39,13 +39,9 @@ from .random import get_cuda_rng_tracker
 from .utils import divide
 from .utils import split_tensor_along_last_dim
 from .utils import VocabUtility
+from .quantization_utils import quantization_init
 from megatron import get_args, get_global_memory_buffer
 # from megatron.model.fused_bias_gelu import bias_gelu, bias_gelu_back
-
-from bitsandbytes.nn import Linear8bitLt, Int8Params
-
-QUANTIZED_INFERENCE = True
-
 
 _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {'tensor_model_parallel': False,
                                       'partition_dim': -1,
@@ -296,7 +292,8 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         if ctx.apply_pre_gelu:
             total_input = gelu(total_input)
 
-        if q_linear is not None and QUANTIZED_INFERENCE is True:
+        if q_linear is not None:
+            # if q_linear is passed, regular weight will be ignored
             output = q_linear(total_input)
         else:
             output = torch.matmul(total_input, weight.t())
@@ -384,32 +381,6 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
 
         return grad_input, grad_weight, grad_bias, None, None, None, None
 
-def create_q_linear(weight, bias=None, has_fp16_weights=False, threshold=6.0, index=None):
-    """
-    weight: any kind of weight is fine. fp32, bf16, or fp16. We assume this is a CPU weight, to be converted to int8 upon sending to GPU.
-        From Tim Dettmers: "when cuda() or to(device) is called, Int8Param class should intercept, cast the CPU weight to fp16 and do the transformation to int8 and then cast it to device/cuda."
-    bias: the actual bias tensor. Can also be fp32, bf16, or f16 (optional)
-    Other arg explanations TBD
-    """
-    output_features, input_features = weight.shape
-    has_bias = bias is not None
-    q_linear = Linear8bitLt(input_features, output_features, bias=has_bias, has_fp16_weights=has_fp16_weights, threshold=threshold, index=index)
-    q_linear.weight = weight
-    return q_linear
-
-def post_hook(module, incompatible_keys):
-    # we assume that the weight has been put on CPU and we disabled the initialization
-    has_bias = module.bias is not None
-    if has_bias:
-        raise Exception("LLM int8 conversion currently does not support bias.")
-    module.q_linear = create_q_linear(module.weight, bias=None, has_fp16_weights=False, threshold=6.0, index=None)
-    # If there's another int8 method that requires some kind of conversion from fp16=>int8, put your logic for that here.
-    module.q_linear.to(torch.cuda.current_device()) # send it over and get int8!
-
-def pre_hook(module, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
-    empty_data = torch.empty((module.quantized_output_size, module.quantized_input_size), requires_grad=False, dtype=torch.half)
-    module.weight = Int8Params(data=empty_data, has_fp16_weights=False, requires_grad=False) # on CPU
-
 class ColumnParallelLinear(torch.nn.Module):
     """Linear layer with column parallelism.
 
@@ -459,11 +430,9 @@ class ColumnParallelLinear(torch.nn.Module):
         # we allocate the transpose.
         # Initialize weight.
         # args = get_args()
-        if QUANTIZED_INFERENCE:
-            self.quantized_output_size = self.output_size_per_partition
-            self.quantized_input_size = self.input_size
-            self._register_load_state_dict_pre_hook(pre_hook, with_module=True)
-            self.register_load_state_dict_post_hook(post_hook)
+        self.q_linear = quantization_init(self, self.input_size, self.output_size_per_partition, dtype)
+        if self.q_linear is not None:
+            pass # do nothing, quantization_init will take care of it
         elif use_cpu_initialization:
             self.weight = Parameter(torch.empty(self.output_size_per_partition,
                                                 self.input_size,
@@ -596,12 +565,9 @@ class RowParallelLinear(torch.nn.Module):
         # we allocate the transpose.
         # Initialize weight.
         # args = get_args()
-
-        if QUANTIZED_INFERENCE:
-            self.quantized_output_size = self.output_size
-            self.quantized_input_size = self.input_size_per_partition
-            self._register_load_state_dict_pre_hook(pre_hook, with_module=True)
-            self.register_load_state_dict_post_hook(post_hook)
+        self.q_linear = quantization_init(self, self.input_size_per_partition, self.output_size, dtype)
+        if self.q_linear is not None:
+            pass # do nothing, quantization_init will take care of it
         elif use_cpu_initialization:
             self.weight = Parameter(torch.empty(self.output_size,
                                                 self.input_size_per_partition,
